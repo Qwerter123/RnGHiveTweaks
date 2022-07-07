@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# Usage: amd-oc log|stop|reset|nocolor|quiet
+
+#custom string for autorestart miner
+miner stop && /hive/bin/message success "autostop miner"
+
+OC_LOG=/var/log/amd-oc.log
+OC_TIMEOUT=120
+
+
+[[ -f $RIG_CONF ]] && source $RIG_CONF
+set -o pipefail
+
+n=`gpu-detect AMD`
+if [[ $n -eq 0 ]]; then
+	#echo "No AMD cards detected"
+	exit 0
+fi
+
+[[ "$1" != "nocolor" ]] && source colors
+
+if [[ "$1" == "log" ]]; then
+	[[ ! -f $OC_LOG ]] && echo "${YELLOW}$OC_LOG does not exist${NOCOLOR}" && exit 1
+	cat $OC_LOG 2>/dev/null && echo -e "\n${GRAY}=== $OC_LOG === $( stat -c %y $OC_LOG )${NOCOLOR}"
+	exit
+fi
+
+# do not run OC simultaneously
+if [[ "$2" != "internal" ]]; then
+	readarray -t pids < <( pgrep -f "timeout .*$OC_LOG" )
+	for pid in "${pids[@]}"; do
+		echo -e "${BYELLOW}Killing running amd-oc ($pid)${NOCOLOR}\n"
+		# timeout process PID is equal to the PGID, so using it to kill process group
+		kill -- -$pid
+	done
+fi
+
+# just exit here
+[[ "$1" == "stop" ]] && exit 0
+
+[[ $MAINTENANCE == 2 ]] &&
+	echo "${YELLOW}Maintenance mode enabled, exiting${NOCOLOR}" &&
+	exit 1
+
+
+# start main OC with timeout and logging
+if [[ "$2" != "internal" ]]; then
+	trap "echo -n $NOCOLOR" EXIT
+	timeout --foreground -s9 $OC_TIMEOUT bash -c "set -o pipefail; $0 \"$1\" internal 2>&1 | tee $OC_LOG"
+	exitcode=$?
+	if [[ $exitcode -ne 0 && $exitcode -ne 143 ]]; then
+		echo "${RED}ERROR: AMD OC failed${NOCOLOR}"
+		[[ "$1" != "quiet" ]] && cat $OC_LOG | message error "AMD OC failed" payload > /dev/null
+	fi
+	exit $exitcode
+fi
+
+
+print_array() {
+	local desc=$1
+	local arr=($2)
+	local align=10
+	local pad=5
+	printf "%-${align}s :" "$desc"
+	for item in "${arr[@]}"
+	do
+		printf "%${pad}s" "$item"
+	done
+	printf "\n"
+}
+
+
+date
+echo -e "\nDetected $n AMD cards\n"
+
+if [[ "$1" == "reset" ]]; then
+	echo -e "${YELLOW}Resetting OC to defaults${NOCOLOR}\n"
+else
+	[[ ! -f $AMD_OC_CONF ]] &&
+		echo "${YELLOW}$AMD_OC_CONF does not exist, exiting${NOCOLOR}" &&
+		exit 0
+	source $AMD_OC_CONF
+fi
+
+if [[ ! -f $GPU_DETECT_JSON ]]; then
+	gpu_detect_json=`gpu-detect listjson`
+else
+	gpu_detect_json=$(< $GPU_DETECT_JSON)
+fi
+
+source /hive/etc/gpu.ids
+
+# use target temp for HW autofan if AMD is disabled in autofan settings
+AMD_TARGET_TEMP=
+[[ -f $AUTOFAN_CONF ]] && AMD_TARGET_TEMP=$( source $AUTOFAN_CONF && [[ $ENABLED == 1 && $NO_AMD == 1 ]] && echo "$TARGET_TEMP" )
+
+
+idx=0
+while IFS=";" read busid brand name mem vbios; do
+	BUSID[$idx]="$busid"
+	BRAND[$idx]="$brand"
+	NAME[$idx]="$name"
+	RAM[$idx]="$mem"
+	VBIOS[$idx]="$vbios"
+	((idx++))
+done < <( echo "$gpu_detect_json" | jq -r -c '.[] | select(.brand == "amd" or .vendor == "AMD") | (.busid+";"+.brand+";"+.name+";"+.mem+";"+.vbios)' 2>/dev/null )
+
+
+# this is needed for amdmemorytweak to work correct when internal AMD gpu is present
+readarray -t AMD_ALL_BUSID < <(lspci | grep -E "$GPU_DETECT_STRING" | grep "AMD" | cut -d" " -f1)
+
+
+n=${#BUSID[@]}
+if [[ $n -eq 0 ]]; then
+	echo -e "${RED}ERROR: No cards available for OC!\n${NOCOLOR}Please check BIOS settings, risers, connectors and PSU.\nUse OS image with suitable AMD driver version."
+	exit 1
+fi
+
+[[ -f "$BUSID_FILE" ]] && source $BUSID_FILE
+
+PARAMS=(CORE_CLOCK CORE_VDDC CORE_STATE MEM_CLOCK MEM_STATE MVDD VDDCI SOCCLK SOCVDDMAX REF FAN PL)
+
+# pad arrays
+for param in "${PARAMS[@]}"; do
+	[[ -z ${!param} ]] && continue
+	declare -n ref_arr="${param}"
+	ref_arr=( ${!param} )
+	for ((i=${#ref_arr[@]}; i < n; i++)); do
+		ref_arr[i]="${ref_arr[-1]}" # use last element of initial array
+	done
+done
+
+print_array "GPU BUS ID" "${BUSID[*]/:00\.0}"
+for param in "${PARAMS[@]}"; do
+	arr="${param}[*]"
+	[[ -z "${!arr}" ]] && continue
+	print_array "$param" "${!arr}"
+done
+
+echo "AGGRESSIVE = $AGGRESSIVE"
+
+
+card_idx=-1 # including APU
+index=-1
+
+for (( i=0; i < $n; i++ )); do
+	if [[ "${BRAND[$i]}" == "amd" ]]; then
+		((card_idx++))
+		((index++))
+	fi
+
+	echo ""
+	busid="${BUSID[$i]}"
+
+	# skip internal gpu/apu
+	while [[ ! -z "${AMD_ALL_BUSID[$card_idx]}" && "${AMD_ALL_BUSID[$card_idx]}" != "$busid" ]]; do
+		#echo -e "${YELLOW}Skipping internal AMD GPU ${AMD_ALL_BUSID[$card_idx]}${NOCOLOR}"
+		((card_idx++))
+	done
+
+	if [[ "${BRAND[$i]}" != "amd" ]]; then
+		echo "${YELLOW}===${NOCOLOR} GPU ${CYAN}-${NOCOLOR}, ${PURPLE}$busid ${RED}${NAME[$i]}${NOCOLOR} - ${BYELLOW}${VBIOS[$i]} ${YELLOW}=== $(date +%T)${NOCOLOR}"
+		continue
+	fi
+
+	[[ `echo /sys/bus/pci/devices/0000:$busid/drm/card*/` =~ \/card([0-9]+)\/ ]]
+	cardno=${BASH_REMATCH[1]}
+
+	echo "${YELLOW}===${NOCOLOR} GPU ${CYAN}$index${NOCOLOR}, ${PURPLE}$busid ${RED}${NAME[$i]} ${WHITE}${RAM[$i]} ${YELLOW}=== $(date +%T)${NOCOLOR}"
+
+	[[ -z $cardno ]] && echo -e "${RED}ERROR: can not match card id${NOCOLOR}" && continue
+	[[ ! -f /sys/class/drm/card$cardno/device/pp_table ]] && echo -e "${RED}ERROR: no pp_table${NOCOLOR}" && continue
+
+	savedpp=/tmp/pp_tables/card$cardno/pp_table
+	[[ ! -f $savedpp ]] && echo -e "${RED}ERROR: $savedpp not found, try to reboot${NOCOLOR}" && continue
+
+        gpuname=${NAME[$i]}
+	GPU_TYPE=$( lspci -vnns $busid )
+	VEGAS_COUNT=$( echo $GPU_TYPE | grep VGA -A 2 | grep AMD -A 2 | grep Vega -A 2 | grep -v "Vega 8" | wc -l )
+	NAVI_COUNT=$( echo $GPU_TYPE  | grep -Ei "$GPU_NAVI" | wc -l )
+	IS_VEGA10=$( echo $GPU_TYPE | grep -Ei "$GPU_VEGA10" | wc -l )
+	IS_VEGA20=$( echo $GPU_TYPE | grep -Ei "$GPU_VEGA20" | wc -l )
+	IS_NAVI10=$( echo $GPU_TYPE | grep -Ei "$GPU_NAVI10" | wc -l )
+	IS_NAVI20=$( echo $GPU_TYPE | grep -Ei "$GPU_NAVI20" | wc -l )
+	IS_BC250=$( echo $GPU_TYPE | grep -Ei "$GPU_BC250" | wc -l )
+
+	if [[ $VEGAS_COUNT -eq 0 && $NAVI_COUNT -eq 0 ]]; then
+		source /hive/sbin/amd-oc.polaris.sh
+	elif [[ $NAVI_COUNT -gt 0 || $IS_VEGA20 -gt 0 ]]; then
+		source /hive/sbin/amd-oc.navi.sh
+	#elif [[ $IS_VEGA10 -gt 0 && $AGGRESSIVE == 1 ]]; then
+	#	source /hive/sbin/amd-oc.vega.aggressive.sh
+	#elif [[ $IS_VEGA10 -gt 0 ]]; then
+	else
+		source /hive/sbin/amd-oc.vega.sh
+	fi
+
+done
+
+echo ""
+
+/hive/bin/message success "autostart miner" && miner start
+
+
+exit 0
