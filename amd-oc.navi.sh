@@ -4,23 +4,23 @@
 
 
 # GFX VDDC (Core), mV
-NAVI_CVDDC_MIN=400   # Min VDDC - Gfx Core
+NAVI_CVDDC_MIN=500   # Min VDDC - Gfx Core
 NAVI_CVDDC_MAX=1200  # Max VDDC - Gfx Core
 VEGA_CVDDC_SAFE=900  # Default fail safe voltage for Vega20
 NAVI_CVDDC_SAFE=850  # Default fail safe voltage for Navi10/Navi20
 # SoC VDD limits, mV
-NAVI_SOC_VDD_MIN=450   # Min SoC VDD
+NAVI_SOC_VDD_MIN=250   # Min SoC VDD
 NAVI_SOC_VDD_MAX=1200  # Max SoC VDD
 # Memory Interface Controller Interface Voltage, mV
-NAVI_VDDCI_MIN=450   # Min VDDCI
+NAVI_VDDCI_MIN=500   # Min VDDCI
 NAVI_VDDCI_MAX=850   # Max VDDCI
 # Memory Voltage, mV
-NAVI_MVDD_MIN=1000   # Min MVDD
+NAVI_MVDD_MIN=500   # Min MVDD
 NAVI_MVDD_MAX=1450   # Max MVDD
 # Clocks, MHz
 VEGA_SafeCoreClock=1500
 NAVI_SafeCoreClock=1400
-NAVI_MinCoreClock=450
+NAVI_MinCoreClock=250
 NAVI_MaxMemClock=1075   # Max memory clock
 
 hwmondir=`realpath /sys/class/drm/card${cardno}/device/hwmon/hwmon*/`
@@ -516,7 +516,8 @@ function navi20_oc(){
 
     # Fixed Fclk for some RX 6800 models e.g. ASRock
 #    if [[ $gpuname =~ "6800" && $(cat /sys/class/drm/card${cardno}/device/revision) == "0xc3" ]]; then
-        args+="smc_pptable/FreqTableFclk/0=1550 "
+        let fclk=18*$MEM_CLOCK/7-10390/7;
+        args+="smc_pptable/FreqTableFclk/0=$fclk "
 #    fi
 
     # CORE clock
@@ -587,3 +588,4 @@ fi
 set_PowerLimit
 set_FanSpeed
 
+echo '0' > /sys/class/drm/card${cardno}/device/pp_dpm_fclk
